@@ -3,68 +3,97 @@ import requests
 import json
 import re
 import os
-import hashlib
-import concurrent.futures
 from datetime import datetime, date, timedelta
+from urllib.parse import quote_plus
 from pathlib import Path
 import sqlite3
 import telebot
 from telebot import types
 import threading
-import random
 import traceback
+import random
+import itertools
+
+BASE = "http://139.99.63.204"
+AJAX_PATH = "/ints/agent/res/data_smscdr.php"
+LOGIN_PAGE_URL = BASE + "/ints/login"
+LOGIN_POST_URL = BASE + "/ints/signin"
 
 # ======================
-# 🔐 إعدادات API (من الملف الأول)
+# 🖥️ إعداد لوحات (2 لوحة)
 # ======================
-API_URL = "http://51.77.216.195/crapi/dgroup/viewstats"
-API_TOKEN = "QlJSRTRSQmJ_g2F1houCR19Rj1Z2aIpafG2QiUZUlkdYY3dbapV4"
+DASHBOARD_CONFIGS = [
+    {
+        "name": "Ziad Panel",
+        "api_url": "http://147.135.212.197/crapi/st/viewstats",
+        "token": "R1BTQ0ZBUzRhYlhfQ0-LZV13holmcnhWe1BRZYiRi2F_eIRJfWOOfg==",
+        "type": "old_list",
+        "records": 10,
+        "session": requests.Session(),
+        "is_logged_in": True
+    },
+    {
+        "name": "Ziad Panel",
+        "api_url": "http://147.135.212.197/crapi/bo/viewstats",
+        "token": "R1BTQ0ZBUzRhYlhfQ0-LZV13holmcnhWe1BRZYiRi2F_eIRJfWOOfg==",
+        "type": "new_json",
+        "records": 10,
+        "session": requests.Session(),
+        "is_logged_in": True
+    }
+]
 
 # ======================
-# 🔗 إعدادات البوت (من الملف الثاني)
+# 🚀 تهيئة الـ API والـ Headers
 # ======================
-BOT_TOKEN = "8336904025:AAEo6o696ij2CbE4bx00kfyA4SUYG4rYaFQ"
-CHAT_IDS = ["-1003551242784"]
+COMMON_HEADERS = {
+    "User-Agent": "Albrans-API-Monitor/2.0",
+    "Accept": "application/json"
+}
+
+for dash in DASHBOARD_CONFIGS:
+    dash["session"].headers.update(COMMON_HEADERS)
+    dash["login_page_url"] = ""
+    dash["login_post_url"] = ""
+    dash["ajax_url"] = dash["api_url"]
+    print(f"[{dash['name']}] 🚀 نظام الـ API جاهز للمراقبة...")
+
+# ======================
+# ⚙️ إعدادات البوت والتحكم
+# ======================
+BOT_TOKEN = "8505031797:AAGNJMM6NpbOVQIH0SDAYvXIVe8lFskH2XA"
+CHAT_IDS = ["-1003551242784, -1003619685902"]
+ADMIN_IDS = [8231420847, 7966354929, 1042225523]
+
+# ⚡ تغيير من 5 إلى 0.2 ثانية
 REFRESH_INTERVAL = 0.2  # ⚡ سرعة قصوى - 0.2 ثانية فقط
-ADMIN_IDS = [7966354929, 7645594609, 7946718662, 8231420847]
-DB_PATH = "bot.db"
+TIMEOUT = 5
+MAX_RETRIES = 5
+RETRY_DELAY = 5
+
+# ======================
+# 🗑️ إعدادات حذف الرسائل
+# ======================
 DELETE_MESSAGES_AFTER = 300  # 5 دقائق
+messages_to_delete = []
 
-print(f"[INIT] 🔑 API Token: {API_TOKEN[:10]}...")
-print(f"[INIT] 🤖 Bot Token: {BOT_TOKEN[:10]}...")
-print(f"[INIT] 👥 Admins: {len(ADMIN_IDS)}")
-print(f"[INIT] ⚡⚡⚡ سرعة التحديث القصوى: {REFRESH_INTERVAL} ثانية")
-print(f"[INIT] ⏱️ Auto Delete: {DELETE_MESSAGES_AFTER//60} minutes")
+# الفهارس بناءً على القائمة اللي السيرفر بيبعتها [Service, Num, Msg, Date]
+IDX_SERVICE = 0  # الخدمة
+IDX_NUMBER = 1   # الرقم
+IDX_SMS = 2      # الرسالة
+IDX_DATE = 3     # التاريخ
 
-# ======================
-# 🚀 ذاكرة تخزين مؤقت جديدة
-# ======================
-sent_messages_cache = {}
-CACHE_CLEAN_INTERVAL = 60
-last_cache_clean = time.time()
+DB_PATH = "bot_database.db"
+SENT_MESSAGES_FILE = "sent_messages.json"
+BOT_ACTIVE = True
 
-def cleanup_cache():
-    global sent_messages_cache, last_cache_clean
-    current_time = time.time()
-    if current_time - last_cache_clean > CACHE_CLEAN_INTERVAL:
-        ten_minutes_ago = current_time - 600
-        to_delete = [k for k, v in sent_messages_cache.items() if v < ten_minutes_ago]
-        for key in to_delete:
-            del sent_messages_cache[key]
-        last_cache_clean = current_time
-
-def add_to_cache(message_key):
-    sent_messages_cache[message_key] = time.time()
-    if len(sent_messages_cache) > 1000:
-        oldest_keys = sorted(sent_messages_cache.items(), key=lambda x: x[1])[:200]
-        for key, _ in oldest_keys:
-            del sent_messages_cache[key]
-
-def is_in_cache(message_key):
-    return message_key in sent_messages_cache
+if not BOT_TOKEN:
+    raise SystemExit("❌ BOT_TOKEN must be set in Secrets (Environment Variables)")
+if not CHAT_IDS:
+    raise SystemExit("❌ CHAT_IDS must be configured")
 
 # ======================
-# 🌍 أكواد الدول (من الملف الثاني)
+# 🌍 أكواد الدول
 # ======================
 COUNTRY_CODES = {
     "1": ("USA/Canada", "🇺🇸", "US"),
@@ -257,7 +286,25 @@ COUNTRY_CODES = {
 }
 
 # ======================
-# 🗄️ دوال قاعدة البيانات
+# 🧰 دوال إدارة قاعدة البيانات
+# ======================
+def get_setting(key):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+# ======================
+# 🧠 إنشاء قاعدة البيانات
 # ======================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -292,6 +339,17 @@ def init_db():
         )
     ''')
     c.execute('''
+        CREATE TABLE IF NOT EXISTS dashboards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            base_url TEXT,
+            ajax_path TEXT,
+            login_page TEXT,
+            login_post TEXT,
+            username TEXT,
+            password TEXT
+        )
+    ''')
+    c.execute('''
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -305,27 +363,34 @@ def init_db():
             PRIMARY KEY (user_id, country_code)
         )
     ''')
+    # جدول القنوات
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS force_sub_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_url TEXT UNIQUE NOT NULL,
+            description TEXT DEFAULT '',
+            enabled INTEGER DEFAULT 1
+        )
+    ''')
+    # إعدادات حذف الرسائل
     c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('delete_after_seconds', '300')")
     c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('delete_messages_enabled', '1')")
+    c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('force_sub_channel', '')")
+    c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('force_sub_enabled', '0')")
+
+    old_channel = get_setting('force_sub_channel')
+    if old_channel and old_channel.strip():
+        channel = old_channel.strip()
+        c.execute("SELECT 1 FROM force_sub_channels WHERE channel_url = ?", (channel,))
+        if not c.fetchone():
+            enabled = 1 if get_setting("force_sub_enabled") == "1" else 0
+            c.execute("INSERT INTO force_sub_channels (channel_url, description, enabled) VALUES (?, ?, ?)",
+                      (channel, "القناة الأساسية", enabled))
+
     conn.commit()
     conn.close()
 
 init_db()
-
-def get_setting(key):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else ""
-
-def set_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
 
 def get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -381,7 +446,14 @@ def unban_user(user_id):
 def is_banned(user_id):
     user = get_user(user_id)
     return user and user[6] == 1
+    
+def is_maintenance_mode():
+    return not BOT_ACTIVE
 
+def set_maintenance_mode(status):
+    global BOT_ACTIVE
+    BOT_ACTIVE = not status
+    
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -474,17 +546,89 @@ def get_otp_logs():
     conn.close()
     return logs
 
-def get_available_numbers(country_code, user_id=None):
-    all_numbers = get_combo(country_code, user_id)
-    if not all_numbers:
-        return []
+def get_user_info(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT assigned_number FROM users WHERE assigned_number IS NOT NULL AND assigned_number != ''")
-    used_numbers = set(row[0] for row in c.fetchall())
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
     conn.close()
-    available = [num for num in all_numbers if num not in used_numbers]
-    return available
+    return row
+
+# ======================
+# 🔐 دوال الاشتراك الإجباري
+# ======================
+def get_all_force_sub_channels(enabled_only=True):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if enabled_only:
+        c.execute("SELECT id, channel_url, description FROM force_sub_channels WHERE enabled = 1 ORDER BY id")
+    else:
+        c.execute("SELECT id, channel_url, description FROM force_sub_channels ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def add_force_sub_channel(channel_url, description=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO force_sub_channels (channel_url, description, enabled) VALUES (?, ?, 1)",
+                  (channel_url.strip(), description.strip()))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def delete_force_sub_channel(channel_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM force_sub_channels WHERE id = ?", (channel_id,))
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+def toggle_force_sub_channel(channel_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE force_sub_channels SET enabled = 1 - enabled WHERE id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+def force_sub_check(user_id):
+    channels = get_all_force_sub_channels(enabled_only=True)
+    if not channels:
+        return True
+
+    for _, url, _ in channels:
+        try:
+            if url.startswith("https://t.me/"):
+                ch = "@" + url.split("/")[-1]
+            elif url.startswith("@"):
+                ch = url
+            else:
+                continue
+            member = bot.get_chat_member(ch, user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception as e:
+            print(f"[!] خطأ في التحقق من القناة {url}: {e}")
+            return False
+    return True
+
+def force_sub_markup():
+    channels = get_all_force_sub_channels(enabled_only=True)
+    if not channels:
+        return None
+
+    markup = types.InlineKeyboardMarkup()
+    for _, url, desc in channels:
+        text = f" {desc}" if desc else " اشترك في القناة"
+        markup.add(types.InlineKeyboardButton(text, url=url))
+    markup.add(types.InlineKeyboardButton("✅ Check your subscription", callback_data="check_sub"))
+    return markup
 
 # ======================
 # 🤖 إنشاء بوت Telegram
@@ -492,508 +636,273 @@ def get_available_numbers(country_code, user_id=None):
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ======================
-# 🔄 API Class (محسنة للسرعة)
+# 🗑️ دوال حذف الرسائل
 # ======================
-class CRAPI:
-    """فئة للتعامل مع CR API مع تحسينات السرعة"""
-    
-    def __init__(self):
-        self.api_url = API_URL
-        self.api_token = API_TOKEN
-        self.session = requests.Session()
-        self.session.timeout = 5  # ⚡ وقت أقل للاتصال
-        self.connection_errors = 0
-        self.last_connection_test = 0
-        
-    def fetch_messages(self, records=150, hours_back=0.08):  # ⚡ زيادة العدد وتقليل الوقت
-        """جلب الرسائل من API"""
-        try:
-            end_time = datetime.now()
-            start_time = end_time - timedelta(hours=hours_back)  # ⚡ 5 دقائق فقط
-            
-            dt1 = start_time.strftime("%Y-%m-%d %H:%M:%S")
-            dt2 = end_time.strftime("%Y-%m-%d %H:%M:%S")
-            
-            params = {
-                'token': self.api_token,
-                'dt1': dt1,
-                'dt2': dt2,
-                'records': records
-            }
-            
-            response = self.session.get(self.api_url, params=params, timeout=8)  # ⚡ وقت أقل
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success':
-                    self.connection_errors = 0
-                    return data.get('data', [])
-                else:
-                    self.connection_errors += 1
-            else:
-                self.connection_errors += 1
-                
-            return []
-            
-        except Exception as e:
-            self.connection_errors += 1
-            print(f"[API] ❌ خطأ في جلب البيانات: {e}")
-            return []
-    
-    def check_token_valid(self):
-        """التحقق من صحة التوكن"""
-        try:
-            params = {'token': self.api_token, 'records': 1}
-            response = self.session.get(self.api_url, params=params, timeout=5)  # ⚡ وقت أقل
-            if response.status_code == 200:
-                data = response.json()
-                status = data.get('status') != 'error'
-                self.last_connection_test = time.time()
-                return status
-            return False
-        except Exception as e:
-            print(f"[API] ❌ خطأ في التحقق: {e}")
-            return False
-    
-    def force_reconnect(self):
-        """إعادة الاتصال القسري بالـ API"""
-        try:
-            print("[API] 🔄 محاولة إعادة الاتصال القسري...")
-            # إنشاء session جديد
-            self.session = requests.Session()
-            self.session.timeout = 5  # ⚡ وقت أقل
-            self.connection_errors = 0
-            
-            # اختبار الاتصال
-            success = self.check_token_valid()
-            
-            if success:
-                print("[API] ✅ إعادة الاتصال ناجحة")
-                return True, "✅ تم إعادة الاتصال بنجاح"
-            else:
-                print("[API] ❌ فشل إعادة الاتصال")
-                return False, "❌ فشل إعادة الاتصال - تأكد من صحة التوكن"
-                
-        except Exception as e:
-            print(f"[API] ❌ خطأ في إعادة الاتصال: {e}")
-            return False, f"❌ خطأ: {str(e)}"
-    
-    def test_connection(self):
-        """اختبار الاتصال بالـ API"""
-        try:
-            start_time = time.time()
-            params = {'token': self.api_token, 'records': 1}
-            response = self.session.get(self.api_url, params=params, timeout=5)  # ⚡ وقت أقل
-            end_time = time.time()
-            response_time = round((end_time - start_time) * 1000, 2)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success':
-                    return True, f"✅ الاتصال نشط\n⏱️ وقت الاستجابة: {response_time}ms"
-                else:
-                    return False, f"❌ الرد غير متوقع\n⏱️ وقت الاستجابة: {response_time}ms"
-            else:
-                return False, f"❌ كود الخطأ: {response.status_code}\n⏱️ وقت الاستجابة: {response_time}ms"
-                
-        except Exception as e:
-            return False, f"❌ خطأ في الاتصال: {str(e)}"
-
-crapi = CRAPI()
-
-# ======================
-# 🗑️ نظام حذف الرسائل
-# ======================
-messages_to_delete = []
-
-def delete_old_messages():
-    """حذف الرسائل القديمة تلقائياً"""
-    while True:
-        try:
-            delete_enabled = get_setting('delete_messages_enabled') == '1'
-            if not delete_enabled:
-                time.sleep(60)
-                continue
-                
-            current_time = datetime.now()
-            to_delete = []
-            delete_after_seconds = int(get_setting('delete_after_seconds') or 300)
-            
-            for msg in messages_to_delete:
-                if current_time >= msg['delete_time']:
-                    to_delete.append(msg)
-            
-            for msg in to_delete:
-                try:
-                    bot.delete_message(msg['chat_id'], msg['message_id'])
-                    print(f"[🗑️] تم حذف الرسالة {msg['message_id']} من الجروب {msg['chat_id']}")
-                    messages_to_delete.remove(msg)
-                except Exception as e:
-                    print(f"[❌] فشل حذف الرسالة {msg['message_id']}: {e}")
-                    if msg in messages_to_delete:
-                        messages_to_delete.remove(msg)
-            
-            time.sleep(60)
-            
-        except Exception as e:
-            print(f"[❌] خطأ في وظيفة حذف الرسائل: {e}")
-            time.sleep(60)
-
-# ======================
-# 📨 دوال الإرسال والتحويل (محسنة من الملف الثاني)
-# ======================
-def get_country_info(number):
-    number = number.strip().replace("+", "").replace(" ", "").replace("-", "")
-    for code, (name, flag, upper_name) in COUNTRY_CODES.items():
-        if number.startswith(code):
-            return name, flag, upper_name
-    return "Unknown", "🌍", "UN"
-
-def mask_number(number):
-    number = number.strip()
-    if len(number) > 8:
-        return number[:4] + "⁦⁦•••" + number[-4:]
-    return number
-
-def extract_otp(message):
-    patterns = [
-        r'(?:code|رمز|كود|verification|تحقق|otp|pin)[:\s]+[‎]?(\d{3,8}(?:[- ]\d{3,4})?)',
-        r'(\d{3})[- ](\d{3,4})',
-        r'\b(\d{4,8})\b',
-        r'[‎](\d{3,8})',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            if len(match.groups()) > 1:
-                return ''.join(match.groups())
-            return match.group(1).replace(' ', '').replace('-', '')
-    all_numbers = re.findall(r'\d{4,8}', message)
-    if all_numbers:
-        return all_numbers[0]
-    return "N/A"
-
-def detect_service(message):
-    message_lower = message.lower()
-
-    services = {
-        "#WP": ["whatsapp", "واتساب", "واتس"],
-        "#FB": ["facebook", "فيسبوك", "fb"],
-        "#IG": ["instagram", "انستقرام", "انستا"],
-        "#TG": ["telegram", "تيليجرام", "تلي"],
-        "#TW": ["twitter", "تويتر", "x"],
-        "#GG": ["google", "gmail", "جوجل", "جميل"],
-        "#DC": ["discord", "ديسكورد"],
-        "#LN": ["line", "لاين"],
-        "#VB": ["viber", "فايبر"],
-        "#SK": ["skype", "سكايب"],
-        "#SC": ["snapchat", "سناب"],
-        "#TT": ["tiktok", "تيك توك", "تيك"],
-        "#AMZ": ["amazon", "امازون"],
-        "#APL": ["apple", "ابل", "icloud"],
-        "#MS": ["microsoft", "مايكروسوفت"],
-        "#IN": ["linkedin", "لينكد"],
-        "#UB": ["uber", "اوبر"],
-        "#AB": ["airbnb", "ايربنب"],
-        "#NF": ["netflix", "نتفلكس"],
-        "#SP": ["spotify", "سبوتيفاي"],
-        "#YT": ["youtube", "يوتيوب"],
-        "#GH": ["github", "جيت هاب"],
-        "#PT": ["pinterest", "بنتريست"],
-        "#PP": ["paypal", "باي بال"],
-        "#BK": ["booking", "بوكينج"],
-        "#TL": ["tala", "تالا"],
-        "#OLX": ["olx", "اوليكس"],
-        "#STC": ["stcpay", "stc"],
-    }
-
-    for service_code, keywords in services.items():
-        for keyword in keywords:
-            if keyword in message_lower:
-                return service_code
-
-    if "code" in message_lower or "verification" in message_lower:
-        if "telegram" in message_lower:
-            return "#TG"
-        if "whatsapp" in message_lower:
-            return "#WP"
-        if "facebook" in message_lower:
-            return "#FB"
-        if "instagram" in message_lower:
-            return "#IG"
-        if "google" in message_lower or "gmail" in message_lower:
-            return "#GG"
-        if "twitter" in message_lower or "x.com" in message_lower:
-            return "#TW"
-
-    return "Unknown"
-
-def html_escape(text):
-    return (str(text)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;"))
-
-def format_message(date_str, number, sms):
-    """تنسيق الرسالة (معدلة من الملف الثاني)"""
-    country_name, country_flag, country_code = get_country_info(number)
-    masked_num = mask_number(number)
-    otp_code = extract_otp(sms)
-    service = detect_service(sms)
-
-    # النص المنسق من الملف الثاني
-    message = (
-        f"\n"
-        f" {country_flag} #{country_code} [{service}] {masked_num} \n"
-        f""
-    )
-    return message
-
-def send_telegram_with_delete(text, otp_code, full_sms=""):
-    """إرسال الرسالة (معدلة من الملف الثاني)"""
+def delete_message_after_delay(chat_id, message_id, delay=300):
+    """تحذف الرسالة بعد مرور delay ثانية"""
+    time.sleep(delay)
     try:
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": f"Click to Copy Code: {otp_code}", "copy_text": {"text": str(otp_code)}}],
-                [{"text": "📋 Full Message", "copy_text": {"text": full_sms}}] if full_sms else [],
-                [
-                    {"text": "Explanation Channel", "url": "https://t.me/OV201"},
-                    {"text": "🤖 Bot Panel", "url": "https://t.me/Rez_num_bot"}
-                ],
-                [{"text": "💬 Channel ", "url": "https://t.me/OV20000"}]
-            ]
-        }
-
-        success_count = 0
-        message_ids = []
-        delete_after_seconds = int(get_setting('delete_after_seconds') or 300)
-        delete_enabled = get_setting('delete_messages_enabled') == '1'
-        
-        for chat_id in CHAT_IDS:
-            try:
-                response = requests.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        "reply_markup": json.dumps(keyboard)
-                    },
-                    timeout=5
-                )
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    if response_data.get("ok") and "result" in response_data:
-                        message_id = response_data["result"]["message_id"]
-                        message_ids.append((chat_id, message_id))
-                        
-                        if delete_enabled and delete_after_seconds > 0:
-                            delete_time = datetime.now() + timedelta(seconds=delete_after_seconds)
-                            messages_to_delete.append({
-                                'chat_id': chat_id,
-                                'message_id': message_id,
-                                'delete_time': delete_time
-                            })
-                        success_count += 1
-                else:
-                    print(f"[!] فشل إرسال إلى {chat_id}: {response.status_code}")
-            except Exception as e:
-                print(f"[!] خطأ Telegram لـ {chat_id}: {e}")
-        
-        return success_count > 0, message_ids
-        
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+        payload = {"chat_id": chat_id, "message_id": message_id}
+        requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print(f"خطأ في إعداد الرسالة: {e}")
-        return False, []
-
-def send_otp_to_user_and_group(date_str, number, sms):
-    """إرسال OTP للمستخدم والجروب (من الملف الثاني)"""
-    try:
-        time.sleep(random.uniform(0.5, 1.5))
-
-        otp_code = extract_otp(sms)
-        country_name, country_flag, country_code = get_country_info(number)
-        service = detect_service(sms)
-
-        try:
-            user_id = get_user_by_number(number)
-            log_otp(number, otp_code, sms, user_id)
-        except:
-            user_id = None
-
-        if user_id:
-            try:
-                markup = types.InlineKeyboardMarkup()
-                markup.row(
-                    types.InlineKeyboardButton("👤 Owner", url="https://t.me/OV20000"),
-                    types.InlineKeyboardButton("📢 Channel", url="https://t.me/OV2001")
-                )
-                bot.send_message(
-                    user_id,
-                    (f"<b><u>✨ 𝙋𝙍𝙄𝙈𝙀 𝙊𝙏𝙋 𝙃𝙐𝘽 OTP Received ✨</u></b>\n\n"
-                     f"🌍 <b>Country:</b> {country_name} {country_flag}\n"
-                     f"⚙ <b>Service:</b> {service}\n"
-                     f"☎ <b>Number:</b> <code>{number}</code>\n"
-                     f"🕒 <b>Time:</b> {date_str}\n\n"
-                     f"🔐 <b>Code:</b> <code>{otp_code}</code>"),
-                    reply_markup=markup, parse_mode="HTML"
-                )
-            except Exception as e:
-                if "Too Many Requests" in str(e):
-                    print(f"⚠️ ضغط إرسال للمستخدم {user_id}.. سيتم التخطي للجروب")
-
-        text = format_message(date_str, number, sms)
-        
-        for attempt in range(2):
-            try:
-                send_telegram_with_delete(text, otp_code, sms)
-                print(f"✅ [SUCCESS] GROUP | {number}")
-                break
-            except Exception as e:
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    print(f"⚠️ تليجرام مضغوط.. محاولة {attempt+1} للرقم {number} بعد 4 ثواني")
-                    time.sleep(4)
-                    continue
-                else:
-                    print(f"❌ [ERROR] GROUP | {e}")
-                    break
-
-    except Exception as e:
-        print(f"⚠️ Error in sending Thread: {e}")
+        print(f"❌ فشل حذف الرسالة: {e}")
 
 # ======================
-# 🎯 دوال المساعدة
+# 🎮 وظائف البوت التفاعلي
 # ======================
 def is_admin(user_id):
     return user_id in ADMIN_IDS
-
-# ======================
-# 🎮 أوامر البوت الرئيسية
-# ======================
+    
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    if is_banned(message.from_user.id):
-        bot.reply_to(message, "🚫 You are banned.")
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if is_maintenance_mode() and not is_admin(user_id):
+        maintenance_caption = (
+            "<b>❍─── <u>𝐖𝐞𝐥𝐜𝐨𝐦 𝐭𝐨 𝙋𝙍𝙄𝙈𝙀 𝙊𝙏𝙋 𝙃𝙐𝘽</u> ───❍</b>\n\n"
+            "<b>⚠️ Sorry, dear user</b>\n"
+            "<b>The bot is currently in maintenance mode to update services..</b>\n\n"
+            "<b>⏳ Please try again later.</b>\n"
+            "<b>────────────────────</b>"
+        )
+        maintenance_photo = "https://i.ibb.co/2352v1FN/file-000000004f20720aaa70039fcd26faab-1.png" 
+        
+        try:
+            bot.send_photo(
+                chat_id, 
+                maintenance_photo, 
+                caption=maintenance_caption, 
+                parse_mode="HTML"
+            )
+        except:
+            bot.send_message(chat_id, maintenance_caption, parse_mode="HTML")
         return
-    
-    if not get_user(message.from_user.id):
+
+    if is_banned(user_id):
+        bot.reply_to(message, "<b>🚫 عذراً، لقد تم حظرك من استخدام البوت.</b>", parse_mode="HTML")
+        return
+
+    if not force_sub_check(user_id):
+        markup = force_sub_markup()
+        if markup:
+            bot.send_message(chat_id, "<b>🔒 You must subscribe to the channels to use the bot.</b>", parse_mode="HTML", reply_markup=markup)
+        else:
+            bot.send_message(chat_id, "<b>🔒 الاشتراك الإجباري مفعل لكن لم يتم تحديد قناة!</b>", parse_mode="HTML")
+        return
+
+    if not get_user(user_id):
+        save_user(
+            user_id,
+            username=message.from_user.username or "",
+            first_name=message.from_user.first_name or "",
+            last_name=message.from_user.last_name or ""
+        )
         for admin in ADMIN_IDS:
             try:
-                caption = f"🆕 مستخدم جديد دخل البوت:\n🆔: `{message.from_user.id}`\n👤: @{message.from_user.username or 'None'}\nالاسم: {message.from_user.first_name or ''} {message.from_user.last_name or ''}"
-                bot.send_message(admin, caption, parse_mode="Markdown")
+                caption = (
+                    f"🆕 <b>مستخدم جديد دخل البوت:</b>\n"
+                    f"<b>🆔:</b> <code>{user_id}</code>\n"
+                    f"<b>👤:</b> @{message.from_user.username or 'None'}\n"
+                    f"<b>الاسم:</b> {message.from_user.first_name or ''}"
+                )
+                bot.send_message(admin, caption, parse_mode="HTML")
             except:
                 pass
     
-    save_user(
-        message.from_user.id,
-        username=message.from_user.username or "",
-        first_name=message.from_user.first_name or "",
-        last_name=message.from_user.last_name or ""
-    )
-    
-    markup = types.InlineKeyboardMarkup()
-    user = get_user(message.from_user.id)
-    private_combo = user[7] if user else None
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    user_data = get_user(user_id)
+    private_combo = user_data[7] if user_data else None
     all_combos = get_all_combos()
-    
+
     if private_combo and private_combo in COUNTRY_CODES:
         name, flag, _ = COUNTRY_CODES[private_combo]
-        markup.add(types.InlineKeyboardButton(f"{flag} {name} (Private)", callback_data=f"country_{private_combo}"))
+        buttons.append(types.InlineKeyboardButton(f"{flag} {name} (Private)", callback_data=f"country_{private_combo}"))
 
     for code in all_combos:
         if code in COUNTRY_CODES and code != private_combo:
             name, flag, _ = COUNTRY_CODES[code]
-            markup.add(types.InlineKeyboardButton(f"{flag} {name}", callback_data=f"country_{code}"))
+            buttons.append(types.InlineKeyboardButton(f"{flag} {name}", callback_data=f"country_{code}"))
 
-    if is_admin(message.from_user.id):
+    for i in range(0, len(buttons), 2):
+        markup.row(*buttons[i:i+2])
+
+    if is_admin(user_id):
         markup.add(types.InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel"))
 
-    bot.send_message(message.chat.id, "🌍 Select your country:", reply_markup=markup)
+    fancy_text = (
+        "<b><u>𝐖𝐞𝐥𝐜𝐨𝐦 𝐭𝐨 𝙋𝙍𝙄𝙈𝙀 𝙊𝙏𝙋 𝙃𝙐𝘽</u></b>\n\n"
+        "<b>👨🏻‍💻 <u>𝑷𝑹𝑰𝑴𝑬 𝑯𝑼𝑩 𝑪𝑯𝑨𝑵𝑵𝑬𝑳</u>  • <a href='https://t.me/OV_20000'>𝑪𝑳𝑰𝑪𝑲 𝑯𝑬𝑹𝑬</a></b>\n\n"
+        "<b>────────────────────</b>\n"
+        "<b><u>: 𝐒𝐞𝐥𝐞𝐜𝐭 𝐂𝐨𝐮𝐧𝐭𝐫𝐲</u> ⬇️</b>"
+    )
+
+    bot.send_message(
+        chat_id, 
+        fancy_text, 
+        parse_mode="HTML", 
+        reply_markup=markup,
+        disable_web_page_preview=True
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def check_subscription(call):
+    if force_sub_check(call.from_user.id):
+        bot.answer_callback_query(call.id, "✅ Verified, you can now use the bot.", show_alert=True)
+        send_welcome(call.message)
+    else:
+        bot.answer_callback_query(call.id, "❌ You haven't subscribed yet", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("country_"))
 def handle_country_selection(call):
-    if is_banned(call.from_user.id):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    if is_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 You are banned.", show_alert=True)
         return
-    
-    country_code = call.data.split("_", 1)[1]
-    available_numbers = get_available_numbers(country_code, call.from_user.id)
-    if not available_numbers:
-        bot.edit_message_text("❌ جميع الأرقام قيد الاستخدام حاليًا.", call.message.chat.id, call.message.message_id)
+    if not force_sub_check(user_id):
+        markup = force_sub_markup()
+        bot.send_message(chat_id, "<b>🔒 You must subscribe to the channels to use the bot.</b>", parse_mode="HTML", reply_markup=markup)
         return
+
+    country_code = call.data.split("_", 1)[1]
+    available_numbers = get_available_numbers(country_code, user_id)
     
+    if not available_numbers:
+        error_msg = "<b>❌ نعتذر، جميع الأرقام قيد الاستخدام حالياً لهذه الدولة.</b>"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 العودة لاختيار دولة أخرى", callback_data="back_to_countries"))
+        bot.edit_message_text(error_msg, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+        return
+
     assigned = random.choice(available_numbers)
-    old_user = get_user(call.from_user.id)
+    old_user = get_user(user_id)
     if old_user and old_user[5]:
         release_number(old_user[5])
     
-    assign_number_to_user(call.from_user.id, assigned)
-    save_user(call.from_user.id, country_code=country_code, assigned_number=assigned)
+    assign_number_to_user(user_id, assigned)
+    save_user(user_id, country_code=country_code, assigned_number=assigned)
     
     name, flag, _ = COUNTRY_CODES.get(country_code, ("Unknown", "🌍", ""))
-    msg_text = f"📞*Your Number From {flag} {name}* : `{assigned}`\n\n *Waiting for OTP.…🔑*\n\n_🚨 The OTP will be sent to you here_"
-    
+    msg_text = (
+        f"<b>◈ Number:</b> <code>{assigned}</code>\n"
+        f"<b>◈ Country:</b> {flag} {name}\n"
+        f"<b>◈ Status :</b> ⏳ Waiting for SMS"
+    )
+
     markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("👥 OTP Group", url="https://t.me/spepepepdpdpd"))
     markup.add(types.InlineKeyboardButton("🔄 Change Number", callback_data=f"change_num_{country_code}"))
-    markup.add(types.InlineKeyboardButton("🌍 Change Country", callback_data="back_to_countries"))
-    
-    bot.edit_message_text(msg_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    markup.add(types.InlineKeyboardButton("🔙 Change Country", callback_data="back_to_countries"))
+
+    try:
+        bot.edit_message_text(
+            text=msg_text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        bot.answer_callback_query(call.id, "✅ The number was received successfully")
+    except Exception as e:
+        print(f"Error: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("change_num_"))
 def change_number(call):
-    if is_banned(call.from_user.id):
-        return
+    user_id = call.from_user.id
     
+    if is_banned(user_id):
+        return
+    if not force_sub_check(user_id):
+        return
+        
     country_code = call.data.split("_", 2)[2]
-    available_numbers = get_available_numbers(country_code, call.from_user.id)
-    if not available_numbers:
-        bot.answer_callback_query(call.id, "❌ جميع الأرقام قيد الاستخدام.", show_alert=True)
-        return
+    available_numbers = get_available_numbers(country_code, user_id)
     
-    old_user = get_user(call.from_user.id)
+    if not available_numbers:
+        bot.answer_callback_query(call.id, "❌ نعتذر، جميع الأرقام قيد الاستخدام حالياً.", show_alert=True)
+        return
+
+    old_user = get_user(user_id)
     if old_user and old_user[5]:
         release_number(old_user[5])
-    
+        
     assigned = random.choice(available_numbers)
-    assign_number_to_user(call.from_user.id, assigned)
-    save_user(call.from_user.id, assigned_number=assigned)
+    assign_number_to_user(user_id, assigned)
+    save_user(user_id, assigned_number=assigned)
     
     name, flag, _ = COUNTRY_CODES.get(country_code, ("Unknown", "🌍", ""))
-    msg_text = f"📞*Your Number From {flag} {name}* : `{assigned}`\n\n *Waiting for OTP.…🔑*\n\n_🚨 The OTP will be sent to you here_"
     
+    msg_text = (
+        f"<b>◈ Number:</b> <code>{assigned}</code>\n"
+        f"<b>◈ Country:</b> {flag} {name}\n"
+        f"<b>◈ Status :</b> ⏳ Waiting for SMS"
+    )
+
     markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("👥 OTP Group", url="https://t.me/spepepepdpdpd"))
     markup.add(types.InlineKeyboardButton("🔄 Change Number", callback_data=f"change_num_{country_code}"))
-    markup.add(types.InlineKeyboardButton("🌍 Change Country", callback_data="back_to_countries"))
-    
-    bot.edit_message_text(msg_text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+    markup.add(types.InlineKeyboardButton("🔙 Change Country", callback_data="back_to_countries"))
+
+    try:
+        bot.edit_message_text(
+            text=msg_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        bot.answer_callback_query(call.id, "✅ The number was successfully changed.")
+    except Exception as e:
+        print(f"Error in change_number: {e}")
+        bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_countries")
 def back_to_countries(call):
-    markup = types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    
     user = get_user(call.from_user.id)
     private_combo = user[7] if user else None
     all_combos = get_all_combos()
 
     if private_combo and private_combo in COUNTRY_CODES:
         name, flag, _ = COUNTRY_CODES[private_combo]
-        markup.add(types.InlineKeyboardButton(f"{flag} {name} (Private)", callback_data=f"country_{private_combo}"))
+        buttons.append(types.InlineKeyboardButton(f"{flag} {name} (Private)", callback_data=f"country_{private_combo}"))
 
     for code in all_combos:
         if code in COUNTRY_CODES and code != private_combo:
             name, flag, _ = COUNTRY_CODES[code]
-            markup.add(types.InlineKeyboardButton(f"{flag} {name}", callback_data=f"country_{code}"))
+            buttons.append(types.InlineKeyboardButton(f"{flag} {name}", callback_data=f"country_{code}"))
+
+    for i in range(0, len(buttons), 2):
+        markup.row(*buttons[i:i+2])
 
     if is_admin(call.from_user.id):
-        markup.add(types.InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel"))
+        admin_btn = types.InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")
+        markup.add(admin_btn)
+
+    fancy_text = (
+        "<b>❍<u>𝐖𝐞𝐥𝐜𝐨𝐦 𝐭𝐨 𝙋𝙍𝙄𝙈𝙀 𝙊𝙏𝙋 𝙃𝙐𝘽</u>❍</b>\n\n"
+        "<b>👨🏻‍💻 <u>𝑷𝑹𝑰𝑴𝑬 𝑯𝑼𝑩 𝑪𝑯𝑨𝑵𝑵𝑬𝑳</u>  • <a href='https://t.me/𝑶𝑽20000'>𝑪𝑳𝑰𝑪𝑲 𝑯𝑬𝑹𝑬</a></b>\n\n"
+        "<b>────────────────────</b>\n"
+        "<b><u>𝐒𝐞𝐥𝐞𝐜𝐭 𝐂𝐨𝐮𝐧𝐭𝐫𝐲</u> ⬇️</b>"
+    )
 
     try:
         bot.edit_message_text(
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
-            text="🌍 Select your country:",
-            reply_markup=markup
+            text=fancy_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True
         )
     except Exception as e:
         print(f"Error editing message: {e}")
@@ -1006,179 +915,75 @@ user_states = {}
 
 def admin_main_menu():
     markup = types.InlineKeyboardMarkup()
-    btns = [
-        types.InlineKeyboardButton("📥 Add Combo", callback_data="admin_add_combo"),
-        types.InlineKeyboardButton("🗑️ Delete Combo", callback_data="admin_del_combo"),
-        types.InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
-        types.InlineKeyboardButton("📄 Full Report", callback_data="admin_full_report"),
-        types.InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
-        types.InlineKeyboardButton("✅ Unban User", callback_data="admin_unban"),
-        types.InlineKeyboardButton("📢 Broadcast All", callback_data="admin_broadcast_all"),
-        types.InlineKeyboardButton("📨 Broadcast User", callback_data="admin_broadcast_user"),
-        types.InlineKeyboardButton("👤 User Info", callback_data="admin_user_info"),
-        types.InlineKeyboardButton("🗑️ حذف الرسائل", callback_data="admin_delete_settings"),
-        types.InlineKeyboardButton("👤 كومبو برايفت", callback_data="admin_private_combo"),
-        types.InlineKeyboardButton("🔌 إتصال API", callback_data="admin_reconnect_api"),
-    ]
-    for i in range(0, len(btns), 2):
-        markup.row(*btns[i:i+2])
+    
+    status_icon = "🟢" if not is_maintenance_mode() else "🔴"
+    status_text = "الآن: يعمل بنجاح" if not is_maintenance_mode() else "الآن: قيد الصيانة"
+    markup.add(types.InlineKeyboardButton(f"{status_icon} {status_text} {status_icon}", callback_data="toggle_maintenance"))
+    
+    markup.row(
+        types.InlineKeyboardButton("📥 إضافة كومبو", callback_data="admin_add_combo"),
+        types.InlineKeyboardButton("🗑️ حذف كومبو", callback_data="admin_del_combo")
+    )
+    
+    markup.row(
+        types.InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+        types.InlineKeyboardButton("📄 تقرير شامل", callback_data="admin_full_report")
+    )
+    
+    markup.row(
+        types.InlineKeyboardButton("📢 إذاعة عامة", callback_data="admin_broadcast_all"),
+        types.InlineKeyboardButton("📨 إذاعة مخصصة", callback_data="admin_broadcast_user")
+    )
+    
+    markup.row(
+        types.InlineKeyboardButton("🚫 حظر", callback_data="admin_ban"),
+        types.InlineKeyboardButton("✅ إلغاء حظر", callback_data="admin_unban"),
+        types.InlineKeyboardButton("👤 معلومات", callback_data="admin_user_info")
+    )
+    
+    markup.row(
+        types.InlineKeyboardButton("🔗 إشتراك", callback_data="admin_force_sub"),
+        types.InlineKeyboardButton("🖥️ اللوحات", callback_data="admin_dashboards"),
+        types.InlineKeyboardButton("🔑 برايفت", callback_data="admin_private_combo")
+    )
+    
+    markup.add(types.InlineKeyboardButton("🗑️ حذف الرسائل", callback_data="admin_delete_settings"))
+    markup.add(types.InlineKeyboardButton("🔙 مغادرة لوحة التحكم", callback_data="back_to_countries"))
+    
     return markup
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel")
-def admin_panel(call):
+def show_admin_panel(call):
     if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⚠️ عذراً، هذا القسم للمطورين فقط.", show_alert=True)
         return
-    bot.edit_message_text("🔐 Admin Panel", call.message.chat.id, call.message.message_id, reply_markup=admin_main_menu())
 
-# ======================
-# 🔌 زر إعادة الاتصال بالـ API
-# ======================
-@bot.callback_query_handler(func=lambda call: call.data == "admin_reconnect_api")
-def admin_reconnect_api(call):
-    if not is_admin(call.from_user.id):
-        return
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔄 إعادة الاتصال الآن", callback_data="force_reconnect"))
-    markup.add(types.InlineKeyboardButton("📊 اختبار الاتصال", callback_data="test_api_connection"))
-    markup.add(types.InlineKeyboardButton("🔄 إعادة تشغيل البوت", callback_data="restart_bot"))
-    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
-    
-    token_valid = crapi.check_token_valid()
-    api_status = "🟢 نشط" if token_valid else "🔴 غير نشط"
-    
-    last_test = "غير معروف"
-    if crapi.last_connection_test > 0:
-        elapsed = int(time.time() - crapi.last_connection_test)
-        if elapsed < 60:
-            last_test = f"قبل {elapsed} ثانية"
-        else:
-            last_test = f"قبل {elapsed//60} دقيقة"
-    
-    text = f"🔌 **إعدادات اتصال API**\n\n"
-    text += f"📡 **الحالة الحالية:** {api_status}\n"
-    text += f"⏰ **آخر اختبار:** {last_test}\n"
-    text += f"❌ **أخطاء الاتصال:** {crapi.connection_errors}\n"
-    text += f"🔗 **URL:** `{API_URL[:30]}...`\n"
-    text += f"🔑 **Token:** `{API_TOKEN[:15]}...`\n"
-    text += f"⚡ **سرعة التحديث:** {REFRESH_INTERVAL} ثانية\n\n"
-    text += "استخدم الأزرار أدناه للتحكم في الاتصال:"
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                         reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "force_reconnect")
-def force_reconnect(call):
-    if not is_admin(call.from_user.id):
-        return
-    
-    bot.answer_callback_query(call.id, "🔄 جاري إعادة الاتصال بالـ API...", show_alert=False)
+    admin_text = (
+        "<b>❍─── <u>𝐋𝐎𝐆𝐈𝐍 𝐀𝐃𝐌𝐈𝐍 𝐏𝐀𝐍𝐄𝐋</u> ───❍</b>\n\n"
+        "<b>👋 مرحباً بك يا مطور في لوحة التحكم.</b>\n\n"
+        "<b>⚙️ يمكنك التحكم في كامل وظائف البوت من هنا.</b>\n"
+        "<b>⚠️ تنبيه: أي تغيير في الإعدادات يؤثر على المستخدمين فوراً.</b>\n\n"
+        "<b>────────────────────</b>\n"
+        "<b>إحصائيات سريعة:</b>\n"
+        "<b>• حالة السيرفر: <u>Online</u> ✅</b>\n"
+        f"<b>• الوقت الحالي: <u>{datetime.now().strftime('%H:%M')}</u></b>\n"
+        "<b>────────────────────</b>"
+    )
     
     try:
-        success, message = crapi.force_reconnect()
-        
-        if success:
-            test_success, test_message = crapi.test_connection()
-            
-            response = f"✅ **تم إعادة الاتصال بنجاح**\n\n"
-            response += f"📡 **حالة الاتصال:** {test_message}\n"
-            response += f"⏰ **الوقت:** {datetime.now().strftime('%H:%M:%S')}\n\n"
-            response += "سيبدأ البوت في استقبال الأكواد فوراً."
-            
-            bot.send_message(call.from_user.id, response, parse_mode="Markdown")
-            
-        else:
-            bot.send_message(call.from_user.id, 
-                           f"❌ **فشل إعادة الاتصال**\n\n{message}\n\n"
-                           f"⏰ **الوقت:** {datetime.now().strftime('%H:%M:%S')}",
-                           parse_mode="Markdown")
-        
-        admin_reconnect_api(call)
-        
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=admin_text,
+            parse_mode="HTML",
+            reply_markup=admin_main_menu(),
+            disable_web_page_preview=True
+        )
     except Exception as e:
-        bot.send_message(call.from_user.id, 
-                       f"❌ **خطأ غير متوقع**\n\n{str(e)}",
-                       parse_mode="Markdown")
-        admin_reconnect_api(call)
-
-@bot.callback_query_handler(func=lambda call: call.data == "test_api_connection")
-def test_api_connection(call):
-    if not is_admin(call.from_user.id):
-        return
-    
-    bot.answer_callback_query(call.id, "📊 جاري اختبار الاتصال...", show_alert=False)
-    
-    try:
-        success, message = crapi.test_connection()
-        
-        if success:
-            response = f"✅ **اختبار الاتصال ناجح**\n\n"
-            response += f"📡 **النتيجة:** {message}\n"
-            response += f"🔗 **API URL:** `{API_URL}`\n"
-            response += f"⏰ **الوقت:** {datetime.now().strftime('%H:%M:%S')}"
-        else:
-            response = f"❌ **اختبار الاتصال فاشل**\n\n"
-            response += f"📡 **السبب:** {message}\n"
-            response += f"🔗 **API URL:** `{API_URL}`\n"
-            response += f"⏰ **الوقت:** {datetime.now().strftime('%H:%M:%S')}\n\n"
-            response += "يمكنك محاولة إعادة الاتصال باستخدام الزر أدناه."
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔄 إعادة الاتصال", callback_data="force_reconnect"))
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_reconnect_api"))
-        
-        bot.edit_message_text(response, call.message.chat.id, call.message.message_id,
-                             reply_markup=markup, parse_mode="Markdown")
-        
-    except Exception as e:
-        bot.send_message(call.from_user.id, 
-                       f"❌ **خطأ في اختبار الاتصال**\n\n{str(e)}",
-                       parse_mode="Markdown")
-        admin_reconnect_api(call)
-
-@bot.callback_query_handler(func=lambda call: call.data == "restart_bot")
-def restart_bot(call):
-    if not is_admin(call.from_user.id):
-        return
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ نعم، أعد التشغيل", callback_data="confirm_restart"))
-    markup.add(types.InlineKeyboardButton("❌ لا، إلغاء", callback_data="admin_reconnect_api"))
-    
-    bot.edit_message_text("🔄 **إعادة تشغيل البوت**\n\n"
-                         "هل أنت متأكد أنك تريد إعادة تشغيل البوت؟\n"
-                         "هذا سيوقف مؤقتاً استقبال الأكواد لمدة 5 ثواني.",
-                         call.message.chat.id, call.message.message_id,
-                         reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "confirm_restart")
-def confirm_restart(call):
-    if not is_admin(call.from_user.id):
-        return
-    
-    bot.answer_callback_query(call.id, "🔄 جاري إعادة تشغيل البوت...", show_alert=True)
-    
-    try:
-        global crapi
-        crapi = CRAPI()
-        
-        bot.send_message(call.from_user.id, 
-                       "✅ **تم إعادة تشغيل البوت بنجاح**\n\n"
-                       "📡 **تمت إعادة تهئة اتصال API**\n"
-                       "⏰ **الوقت:** " + datetime.now().strftime('%H:%M:%S') + "\n\n"
-                       "البوت يعمل الآن بشكل طبيعي.",
-                       parse_mode="Markdown")
-        
-        admin_reconnect_api(call)
-        
-    except Exception as e:
-        bot.send_message(call.from_user.id,
-                       f"❌ **خطأ في إعادة التشغيل**\n\n{str(e)}",
-                       parse_mode="Markdown")
-        admin_reconnect_api(call)
+        print(f"Admin Panel Error: {e}")
 
 # ======================
-# 🗑️ إعدادات حذف الرسائل
+# 🗑️ إعدادات حذف الرسائل في لوحة الإدارة
 # ======================
 @bot.callback_query_handler(func=lambda call: call.data == "admin_delete_settings")
 def admin_delete_settings(call):
@@ -1284,234 +1089,426 @@ def disable_auto_delete(call):
     admin_delete_settings(call)
 
 # ======================
-# 📊 باقي أوامر الأدمن
+# 📨 دوال إرسال OTP المحسنة
 # ======================
-@bot.callback_query_handler(func=lambda call: call.data == "admin_add_combo")
-def admin_add_combo(call):
-    if not is_admin(call.from_user.id):
-        return
-    user_states[call.from_user.id] = "waiting_combo_file"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text("📤 أرسل ملف الكومبو بصيغة TXT", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-@bot.message_handler(content_types=['document'])
-def handle_combo_file(message):
-    if not is_admin(message.from_user.id):
-        return
-    if user_states.get(message.from_user.id) != "waiting_combo_file":
-        return
+def send_otp_to_user_and_group(date_str, number, sms, service_api=None):
     try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        content = downloaded_file.decode('utf-8')
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
-        if not lines:
-            bot.reply_to(message, "❌ الملف فارغ!")
-            return
+        time.sleep(random.uniform(0.5, 1.5))  # ⚡ وقت انتظار أقل
+
+        otp_code = extract_otp(sms)
+        country_name, country_flag, country_code = get_country_info(number)
+        service = service_api if service_api else detect_service(sms)
+
+        try:
+            user_id = get_user_by_number(number)
+            log_otp(number, otp_code, sms, user_id)
+        except:
+            user_id = None
+
+        if user_id:
+            try:
+                markup = types.InlineKeyboardMarkup()
+                markup.row(
+                    types.InlineKeyboardButton("👤 Owner", url="https://t.me/o_k_60"),
+                    types.InlineKeyboardButton("📢 Channel", url="https://t.me/speed010speed")
+                )
+                bot.send_message(
+                    user_id,
+                    (f"<b><u>✨ SPEED OTP Received ✨</u></b>\n\n"
+                     f"🌍 <b>Country:</b> {country_name} {country_flag}\n"
+                     f"⚙ <b>Service:</b> {service}\n"
+                     f"☎ <b>Number:</b> <code>{number}</code>\n"
+                     f"🕒 <b>Time:</b> {date_str}\n\n"
+                     f"🔐 <b>Code:</b> <code>{otp_code}</code>"),
+                    reply_markup=markup, parse_mode="HTML"
+                )
+            except Exception as e:
+                if "Too Many Requests" in str(e):
+                    print(f"⚠️ ضغط إرسال للمستخدم {user_id}.. سيتم التخطي للجروب")
+
+        text = format_message(date_str, number, sms)
         
-        first_num = re.sub(r'\D', '', lines[0])
-        country_code = None
-        for code in COUNTRY_CODES:
-            if first_num.startswith(code):
-                country_code = code
-                break
-        
-        if not country_code:
-            bot.reply_to(message, "❌ لا يمكن تحديد الدولة من الأرقام!")
-            return
-        
-        save_combo(country_code, lines)
-        name, flag, _ = COUNTRY_CODES[country_code]
-        bot.reply_to(message, f"✅ تم حفظ الكومبو لدولة {flag} {name}\n🔢 عدد الأرقام: {len(lines)}")
-        del user_states[message.from_user.id]
+        for attempt in range(2):  # ⚡ محاولتين فقط
+            try:
+                if send_to_telegram_group(text, otp_code, sms):
+                    print(f"✅ [SUCCESS] GROUP | {number}")
+                    break
+                else:
+                    break
+            except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    print(f"⚠️ تليجرام مضغوط.. محاولة {attempt+1} للرقم {number} بعد 4 ثواني")
+                    time.sleep(4)
+                    continue
+                else:
+                    print(f"❌ [ERROR] GROUP | {e}")
+                    break
+
     except Exception as e:
-        bot.reply_to(message, f"❌ خطأ: {e}")
+        print(f"⚠️ Error in sending Thread: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_del_combo")
-def admin_del_combo(call):
-    if not is_admin(call.from_user.id):
-        return
-    combos = get_all_combos()
-    if not combos:
-        bot.answer_callback_query(call.id, "لا توجد كومبوهات!", show_alert=True)
-        return
-    markup = types.InlineKeyboardMarkup()
-    for code in combos:
-        if code in COUNTRY_CODES:
-            name, flag, _ = COUNTRY_CODES[code]
-            markup.add(types.InlineKeyboardButton(f"{flag} {name}", callback_data=f"del_combo_{code}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text("اختر الكومبو للحذف:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+def send_to_telegram_group(text, otp_code, full_sms):
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": f"Click to Copy Code: {otp_code}", "copy_text": {"text": str(otp_code)}}],
+            [{"text": "📋 Full Message", "copy_text": {"text": full_sms}}],
+            [
+                {"text": "Explanations Channel", "url": "https://t.me/OV201"},
+                {"text": "🤖 Bot Panel", "url": "https://t.me/Rez_num_bor"}
+            ],
+            [{"text": "💬 Channel", "url": "https://t.me/OV20000"}]
+        ]
+    }
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del_combo_"))
-def confirm_del_combo(call):
-    if not is_admin(call.from_user.id):
-        return
-    code = call.data.split("_", 2)[2]
-    delete_combo(code)
-    name, flag, _ = COUNTRY_CODES.get(code, ("Unknown", "🌍", ""))
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
-    bot.edit_message_text(f"✅ تم حذف الكومبو: {flag} {name}", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_stats")
-def admin_stats(call):
-    if not is_admin(call.from_user.id):
-        return
-    total_users = len(get_all_users())
-    combos = get_all_combos()
-    total_numbers = sum(len(get_combo(c)) for c in combos)
-    otp_count = len(get_otp_logs())
-    token_valid = crapi.check_token_valid()
-    api_status = "🟢 Active" if token_valid else "🔴 Inactive"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    success_count = 0
     
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+    for chat_id in CHAT_IDS:
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(keyboard)
+            }
+            
+            resp = requests.post(url, json=payload, timeout=5)  # ⚡ وقت أقل
+            
+            if resp.status_code == 200:
+                print(f"✅ [SUCCESS] تم إرسال الرسالة بنجاح إلى: {chat_id}")
+                success_count += 1
+
+                msg_id = resp.json().get("result", {}).get("message_id")
+                if msg_id:
+                    delete_enabled = get_setting('delete_messages_enabled') == '1'
+                    delete_after_seconds = int(get_setting('delete_after_seconds') or 300)
+                    
+                    if delete_enabled and delete_after_seconds > 0:
+                        threading.Thread(
+                            target=delete_message_after_delay, 
+                            args=(chat_id, msg_id, delete_after_seconds), 
+                            daemon=True
+                        ).start()
+            else:
+                print(f"⚠️ [FAILED] تليجرام رفض الطلب لآيدي {chat_id}: {resp.text}")
+                
+        except Exception as e:
+            print(f"❌ [ERROR] خطأ غير متوقع مع آيدي {chat_id}: {e}")
+
+    return success_count > 0
+
+# ======================
+# 📡 دوال الاتصال بالـ API (معدلة للسرعة)
+# ======================
+def retry_request(func, max_retries=MAX_RETRIES, retry_delay=RETRY_DELAY):
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️ محاولة {attempt + 1}/{max_retries} فشلت.. انتظار {retry_delay} ثانية")
+                time.sleep(retry_delay)
+            else:
+                print(f"❌ فشلت جميع المحاولات بعد {max_retries} مرات.")
+                raise
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع: {e}")
+            raise
+
+def login_for_dashboard(dash):
+    dash["is_logged_in"] = True
+    return True
+
+def build_api_url_for_dashboard(dash):
+    start_date = datetime.now().strftime('%Y-%m-%d 00:00:00')
     
-    bot.edit_message_text(
-        f"📊 **Bot Statistics:**\n\n"
-        f"👥 **Active Users:** {total_users}\n"
-        f"🌐 **Countries Added:** {len(combos)}\n"
-        f"📞 **Total Numbers:** {total_numbers:,}\n"
-        f"🔑 **Total OTPs:** {otp_count}\n"
-        f"📡 **API Status:** {api_status}\n"
-        f"🗑️ **Messages to Delete:** {len(messages_to_delete)}",
-        call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown"
+    params = {
+        "token": dash["token"],
+        "dt1": start_date,
+        "dt2": "", 
+        "records": dash["records"]
+    }
+    
+    query_string = "&".join([f"{k}={quote_plus(str(v))}" for k, v in params.items()])
+    return f"{dash['api_url']}?{query_string}"
+
+def fetch_api_json_for_dashboard(dash, url):
+    FETCH_TIMEOUT = 8  # ⚡ تقليل من 15 إلى 8 ثواني
+
+    def do_fetch():
+        r = dash["session"].get(url, timeout=FETCH_TIMEOUT)
+        
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except:
+                print(f"[{dash['name']}] ❌ فشل في تحليل الـ JSON")
+                return None
+        elif r.status_code == 503:
+            print(f"[{dash['name']}] ⚡ السيرفر مضغوط (503).")
+            return None
+        else:
+            print(f"[{dash['name']}] ❌ خطأ سيرفر: {r.status_code}")
+            return None
+
+    try:
+        return retry_request(do_fetch, max_retries=2, retry_delay=2)  # ⚡ تقليل وقت الانتظار
+    except:
+        return None
+
+def extract_rows_from_json(j):
+    if j is None:
+        return []
+
+    for key in ("data", "rows", "aaData", "aa_data"):
+        if isinstance(j, dict) and key in j and isinstance(j[key], list):
+            return j[key]
+
+    if isinstance(j, list):
+        return j
+
+    if isinstance(j, dict):
+        for v in j.values():
+            if isinstance(v, list):
+                return v
+
+    return []
+
+def fetch_data():
+    if not DASHBOARD_CONFIGS:
+        return []
+
+    dash = DASHBOARD_CONFIGS[0]
+    today = datetime.now().strftime('%Y-%m-%d 00:00:00')
+
+    try:
+        url = (
+            f"{dash['api_url']}?"
+            f"token={dash['token']}&"
+            f"dt1={quote_plus(today)}&"
+            f"records={dash['records']}"
+        )
+        r = requests.get(url, timeout=8)  # ⚡ تقليل من 15 إلى 8 ثواني
+        if r.status_code == 200:
+            return extract_rows_from_json(r.json())
+    except Exception as e:
+        print(f"❌ API Error: {e}")
+
+    return []
+
+def clean_html(text):
+    if not text:
+        return ""
+    text = str(text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.strip()
+    return text
+
+def clean_number(number):
+    if not number:
+        return ""
+    number = re.sub(r'\D', '', str(number))
+    return number
+
+def row_to_tuple(row, config_type="old_list"):
+    date_str, number, sms = "", "", ""
+    
+    if config_type == "old_list":
+        try:
+            date_str = clean_html(str(row[0]))
+            number = clean_number(str(row[1]))
+            sms = clean_html(str(row[2]))
+        except:
+            pass
+
+    elif config_type == "new_json":
+        date_str = clean_html(str(row.get("dt", "")))
+        number = clean_number(str(row.get("num", "")))
+        sms = clean_html(str(row.get("message", "")))
+
+    key = f"{number}|{sms}|{date_str}"
+    return date_str, number, sms, key
+
+def get_country_info(number):
+    number = number.strip().replace("+", "").replace(" ", "").replace("-", "")
+
+    for code, (name, flag, short) in COUNTRY_CODES.items():
+        if number.startswith(code):
+            return name, flag, short
+
+    return "Unknown", "🌍", "UN"
+
+def mask_number(number):
+    number = number.strip()
+    if len(number) > 8:
+        return number[:4] + "⁦⁦•••" + number[-4:]
+    return number
+
+def extract_otp(message):
+    patterns = [
+        r'(?:code|رمز|كود|verification|تحقق|otp|pin)[:\s]+[‎]?(\d{3,8}(?:[- ]\d{3,4})?)',
+        r'(\d{3})[- ](\d{3,4})',
+        r'\b(\d{4,8})\b',
+        r'[‎](\d{3,8})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            if len(match.groups()) > 1:
+                return ''.join(match.groups())
+            return match.group(1).replace(' ', '').replace('-', '')
+    all_numbers = re.findall(r'\d{4,8}', message)
+    if all_numbers:
+        return all_numbers[0]
+    return "N/A"
+
+def detect_service(message):
+    message_lower = message.lower()
+
+    services = {
+        "#WP": ["whatsapp", "واتساب", "واتس"],
+        "#FB": ["facebook", "فيسبوك", "fb"],
+        "#IG": ["instagram", "انستقرام", "انستا"],
+        "#TG": ["telegram", "تيليجرام", "تلي"],
+        "#TW": ["twitter", "تويتر", "x"],
+        "#GG": ["google", "gmail", "جوجل", "جميل"],
+        "#DC": ["discord", "ديسكورد"],
+        "#LN": ["line", "لاين"],
+        "#VB": ["viber", "فايبر"],
+        "#SK": ["skype", "سكايب"],
+        "#SC": ["snapchat", "سناب"],
+        "#TT": ["tiktok", "تيك توك", "تيك"],
+        "#AMZ": ["amazon", "امازون"],
+        "#APL": ["apple", "ابل", "icloud"],
+        "#MS": ["microsoft", "مايكروسوفت"],
+        "#IN": ["linkedin", "لينكد"],
+        "#UB": ["uber", "اوبر"],
+        "#AB": ["airbnb", "ايربنب"],
+        "#NF": ["netflix", "نتفلكس"],
+        "#SP": ["spotify", "سبوتيفاي"],
+        "#YT": ["youtube", "يوتيوب"],
+        "#GH": ["github", "جيت هاب"],
+        "#PT": ["pinterest", "بنتريست"],
+        "#PP": ["paypal", "باي بال"],
+        "#BK": ["booking", "بوكينج"],
+        "#TL": ["tala", "تالا"],
+        "#OLX": ["olx", "اوليكس"],
+        "#STC": ["stcpay", "stc"],
+    }
+
+    for service_code, keywords in services.items():
+        for keyword in keywords:
+            if keyword in message_lower:
+                return service_code
+
+    if "code" in message_lower or "verification" in message_lower:
+        if "telegram" in message_lower:
+            return "#TG"
+        if "whatsapp" in message_lower:
+            return "#WP"
+        if "facebook" in message_lower:
+            return "#FB"
+        if "instagram" in message_lower:
+            return "#IG"
+        if "google" in message_lower or "gmail" in message_lower:
+            return "#GG"
+        if "twitter" in message_lower or "x.com" in message_lower:
+            return "#TW"
+
+    return "Unknown"
+
+def html_escape(text):
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+def format_message(date_str, number, sms):
+    country_name, country_flag, country_code = get_country_info(number)
+    masked_num = mask_number(number)
+    otp_code = extract_otp(sms)
+    service = detect_service(sms)
+
+    message = (
+        f"\n"
+        f" {country_flag} #{country_code} [{service}] {masked_num} \n"
+        f""
     )
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_full_report")
-def admin_full_report(call):
-    if not is_admin(call.from_user.id):
-        return
-    try:
-        report = "📊 تقرير شامل عن البوت\n" + "="*40 + "\n\n"
-        
-        report += "👥 المستخدمون:\n"
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT * FROM users")
-        users = c.fetchall()
-        for u in users:
-            status = "محظور" if u[6] else "نشط"
-            report += f"ID: {u[0]} | @{u[1] or 'N/A'} | الرقم: {u[5] or 'N/A'} | الحالة: {status}\n"
-        report += "\n" + "="*40 + "\n\n"
-        
-        report += "🔑 سجل الأكواد:\n"
-        c.execute("SELECT * FROM otp_logs")
-        logs = c.fetchall()
-        for log in logs:
-            user_info = get_user(log[5]) if log[5] else None
-            user_tag = f"@{user_info[1]}" if user_info and user_info[1] else f"ID:{log[5] or 'N/A'}"
-            report += f"الرقم: {log[1]} | الكود: {log[2]} | المستخدم: {user_tag} | الوقت: {log[4]}\n"
-        
-        conn.close()
-        report += "\n" + "="*40 + "\n\n"
-        report += "تم إنشاء التقرير في: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        with open("bot_report.txt", "w", encoding="utf-8") as f:
-            f.write(report)
-        
-        with open("bot_report.txt", "rb") as f:
-            bot.send_document(call.from_user.id, f)
-        
-        os.remove("bot_report.txt")
-        bot.answer_callback_query(call.id, "✅ تم إرسال التقرير!", show_alert=True)
-        
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ خطأ: {e}", show_alert=True)
+    return message
 
 # ======================
-# 🔄 الحلقة الرئيسية باستخدام API - محسنة للسرعة القصوى
+# 🔄 الحلقة الرئيسية (معدلة للسرعة القصوى)
 # ======================
-def api_main_loop():
-    """الحلقة الرئيسية باستخدام API - محسنة للسرعة القصوى"""
+def main_loop():
     print("=" * 60)
-    print("🚀 Starting OTP Bot - API Version")
+    print("🚀 Monitoring started - Optimized Mode")
     print("⚡⚡⚡ سرعة قصوى: تحديث كل 0.2 ثانية")
     print("=" * 60)
     
+    sent = set()
     error_count = 0
     sent_count = 0
     last_success_time = time.time()
-    
+
     while True:
-        try:
-            current_time = datetime.now().strftime("%H:%M:%S")
-            
-            # تنظيف الذاكرة المؤقتة
-            cleanup_cache()
-            
-            # التحقق من أخطاء الاتصال المتتالية
-            if crapi.connection_errors > 10:
-                print(f"⚠️  Many API errors ({crapi.connection_errors}), checking connection...")
-                token_valid = crapi.check_token_valid()
-                if not token_valid:
-                    print("🔌 API connection lost! Attempting to reconnect...")
-                    crapi.force_reconnect()
-                crapi.connection_errors = 0
-            
-            print(f"[{current_time}] 🔍 Fetching messages from API...")
-            
-            messages = crapi.fetch_messages(records=150, hours_back=0.08)  # ⚡ 5 دقائق فقط
-            
-            if messages:
-                print(f"[API] 📨 Received {len(messages)} messages")
+        current_time = datetime.now().strftime("%H:%M:%S")
+        
+        for dash in DASHBOARD_CONFIGS:
+            try:
+                # ⚡ جلب البيانات بسرعة
+                response = dash["session"].get(
+                    dash['api_url'], 
+                    params={"token": dash['token'], "records": dash['records']}, 
+                    timeout=3  # ⚡ تقليل من 5 إلى 3 ثواني
+                )
                 
-                for msg in messages:
-                    # إنشاء مفتاح فريد للرسالة باستخدام الـ hash
-                    msg_content = f"{msg.get('num', '')}_{msg.get('message', '')}_{msg.get('dt', '')}"
-                    msg_hash = hashlib.md5(msg_content.encode()).hexdigest()[:12]
-                    
-                    # التحقق إذا كانت الرسالة مرسلة مسبقاً
-                    if is_in_cache(msg_hash):
-                        continue
-                    
-                    # معالجة الرسالة
-                    date_str = msg.get('dt', '')
-                    number = msg.get('num', '')
-                    message_text = msg.get('message', '')
-                    
-                    if not date_str or not number or not message_text:
-                        continue
-                    
-                    # إرسال OTP للمستخدم والجروب (من الملف الثاني)
-                    threading.Thread(
-                        target=send_otp_to_user_and_group, 
-                        args=(date_str, number, message_text),
-                        daemon=True
-                    ).start()
-                    
-                    # إضافة للذاكرة المؤقتة
-                    add_to_cache(msg_hash)
-                    
-                    sent_count += 1
-                    last_success_time = time.time()
-                    
-                    print(f"[✅] تم إرسال: {get_country_info(number)[0]} | {extract_otp(message_text)}")
-                    
-                    # ⚡ إزالة الـ sleep بين الرسائل تماماً
-                    # لا يوجد time.sleep هنا - أسرع ما يمكن
-                    
-            else:
-                print(f"[{current_time}] ⏳ No new messages")
+                result = response.json()
+                rows = result.get('data', []) if isinstance(result, dict) else result
                 
-                # ⚡ تقليل وقت الانتظار عند عدم وجود رسائل
-                time.sleep(REFRESH_INTERVAL)  # ⚡ 0.2 ثانية فقط
-            
-            error_count = 0
-            
-        except requests.exceptions.RequestException as e:
-            error_count += 1
-            crapi.connection_errors += 1
-            print(f"[!] ❌ Network error: {e}")
-            time.sleep(2)  # ⚡ وقت انتظار أقل عند الأخطاء
-            
-        except Exception as e:
-            error_count += 1
-            print(f"[!] ❌ Error in main loop: {e}")
-            traceback.print_exc()
-            time.sleep(1)  # ⚡ وقت انتظار أقل عند الأخطاء
+                if not rows: 
+                    continue
+
+                # ⚡ معالجة الرسائل بسرعة
+                for row in rows[-10:]:
+                    try:
+                        date_str, number, sms, key = row_to_tuple(row, dash.get('type', 'old_list'))
+
+                        if key not in sent:
+                            print(f"📩 [{dash['name']}] New: {number}")
+                            
+                            threading.Thread(
+                                target=send_otp_to_user_and_group, 
+                                args=(date_str, number, sms),
+                                daemon=True
+                            ).start()
+                            
+                            sent.add(key)
+                            sent_count += 1
+                            last_success_time = time.time()
+                            
+                            # ⚡ لا يوجد time.sleep هنا بين الرسائل
+                            
+                    except: 
+                        continue
+
+                error_count = 0
+                
+            except Exception as e:
+                error_count += 1
+                print(f"⚠️ {dash['name']} Error: {e}")
+                
+                if error_count > 5:
+                    print("⚡ إعادة محاولة الاتصال...")
+                    time.sleep(1)  # ⚡ استراحة قصيرة
+                continue
+        
+        # تنظيف الذاكرة
+        if len(sent) > 2000:
+            sent = set(list(sent)[-1000:])
+        
+        # ⚡ وقت الانتظار بين اللفات
+        time.sleep(REFRESH_INTERVAL)  # 0.2 ثانية فقط
 
 # ======================
 # 🚀 تشغيل البوت
@@ -1522,23 +1519,20 @@ def run_bot():
     bot.polling(none_stop=True, interval=0.5)
 
 if __name__ == "__main__":
-    # تشغيل وظيفة حذف الرسائل
-    delete_thread = threading.Thread(target=delete_old_messages)
-    delete_thread.daemon = True
-    delete_thread.start()
-    
-    # تشغيل البوت
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # إعطاء البوت وقت للبدء
-    time.sleep(1)  # ⚡ تقليل من 3 إلى 1 ثانية
-    
-    # تشغيل الحلقة الرئيسية
-    print("=" * 60)
-    print("🚀 Starting API Loop...")
-    print("⚡⚡⚡ سرعة التحديث: كل 0.2 ثانية")
-    print("=" * 60)
-    
-    api_main_loop()
+    try:
+        bot_thread = threading.Thread(target=run_bot)
+        bot_thread.daemon = True
+        bot_thread.start()
+        
+        # ⚡ وقت أقل للبدء
+        time.sleep(1)
+        
+        print("=" * 60)
+        print("🚀 Starting Main Loop...")
+        print("⚡⚡⚡ سرعة التحديث: كل 0.2 ثانية")
+        print("=" * 60)
+        
+        main_loop()
+    except Exception as e:
+        print(f"❌ خطأ في التشغيل: {e}")
+        traceback.print_exc()
